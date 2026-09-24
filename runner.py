@@ -1,8 +1,7 @@
-# run_poc.py
+# runner.py
 import argparse
 import json
 import os
-import subprocess
 import time
 from collections import Counter
 from datetime import datetime
@@ -14,10 +13,13 @@ load_dotenv()
 from datasets import load_dataset
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from tools import set_workspace
-from agent_graph import swe_agent, SYSTEM_PROMPT
+from container import container_name, git_diff, prepare
+from tools import EDIT_OK_PREFIX
+from agent_graph import swe_agent, SYSTEM_PROMPT, DUP_PREFIX
 
 MAX_ITER = int(os.getenv("MAX_ITERATIONS", "30"))
+# This copy of SWE-bench Lite carries the `image` column (the princeton-nlp copy does not).
+DATASET_ID = os.getenv("SWE_DATASET", "SWE-bench/SWE-bench_Lite")
 
 
 def parse_args():
@@ -40,35 +42,21 @@ def calculate_patch_stats(patch_str: str) -> dict:
     return {"files": files, "additions": additions, "deletions": deletions}
 
 
-def reset_workspace(workspace_path: Path, base_commit: str):
-    """Restore tracked files to the exact SWE-bench base commit.
-
-    Deliberately no `git clean -x`: bootstrap_container.py copies gitignored .so
-    binaries into the tree and those must survive.
-    """
-    subprocess.run(["git", "reset", "--hard", base_commit], cwd=workspace_path, check=True, capture_output=True)
-    status = subprocess.run(["git", "status", "--short"], cwd=workspace_path, capture_output=True, text=True).stdout.strip()
-    print(f"[*] Workspace reset to {base_commit[:10]}. Remaining status: {status or 'clean'}")
-
-
 def main():
     args = parse_args()
     instance_id = args.instance_id
     start_time = time.perf_counter()
 
-    print(f"[*] Fetching metadata for instance: {instance_id} from Hugging Face...")
-    dataset = load_dataset("princeton-nlp/SWE-bench_Lite", split="test")
+    container_name()  # fail fast if run.ps1 has not started the container
+
+    print(f"[*] Fetching metadata for instance: {instance_id} from {DATASET_ID}...")
+    dataset = load_dataset(DATASET_ID, split="test")
     matches = [inst for inst in dataset if inst["instance_id"] == instance_id]
     if not matches:
         raise ValueError(f"Instance '{instance_id}' not found in SWE-bench_Lite test split.")
     instance = matches[0]
 
-    workspace_path = Path(f"./testbeds/{instance_id}").resolve()
-    if not workspace_path.exists():
-        raise FileNotFoundError(f"Workspace not found at {workspace_path}. Run setup first.")
-
-    reset_workspace(workspace_path, instance["base_commit"])
-    set_workspace(workspace_path)
+    prepare(instance["base_commit"])
 
     metrics = {
         "instance_id": instance_id,
@@ -87,7 +75,6 @@ def main():
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=f"Issue Description:\n{instance['problem_statement']}"),
         ],
-        "workspace_dir": str(workspace_path),
         "iteration": 0,
         "max_iterations": MAX_ITER,
         "patch": "",
@@ -125,10 +112,10 @@ def main():
               elif node_name == "tools":
                   for msg in node_output["messages"]:
                       text = str(msg.content)
-                      if text.startswith("DUPLICATE CALL REJECTED"):
+                      if text.startswith(DUP_PREFIX):
                           metrics["duplicates_rejected"] += 1
                       if msg.tool_call_id in pending_edit_ids:
-                          if text.startswith("Successfully updated"):
+                          if text.startswith(EDIT_OK_PREFIX):
                               metrics["edits_ok"] += 1
                           else:
                               metrics["edits_failed"] += 1
@@ -140,9 +127,11 @@ def main():
     except BaseException as exc:  # includes KeyboardInterrupt and LLM timeouts
         interrupted = f"{type(exc).__name__}: {exc}"
         print(f"\n[!] Run interrupted: {interrupted}")
-        final_patch = subprocess.run(
-            ["git", "diff"], cwd=workspace_path, capture_output=True, text=True
-        ).stdout.strip()
+        try:
+            final_patch = git_diff()
+        except Exception as diff_exc:
+            print(f"[!] Could not collect a patch after the interruption: {diff_exc}")
+            final_patch = ""
 
     elapsed_time = time.perf_counter() - start_time
     patch_stats = calculate_patch_stats(final_patch)
@@ -157,12 +146,12 @@ def main():
         with open("agent_prediction.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(prediction) + "\n")
 
-        # Keep every run's diff, since the next run resets the workspace.
+        # Keep every run's diff on the host, since the container is thrown away after the run.
         runs_dir = Path("runs")
         runs_dir.mkdir(exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         patch_path = runs_dir / f"{instance_id}_{stamp}.patch"
-        patch_path.write_text(final_patch + "\n", encoding="utf-8")
+        patch_path.write_text(final_patch, encoding="utf-8")
         print(f"[+] Patch saved to {patch_path}")
 
     print(f"\n{'='*70}")

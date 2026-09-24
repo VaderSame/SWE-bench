@@ -1,8 +1,6 @@
 # agent_graph.py
 import json
 import os
-import subprocess
-from pathlib import Path
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
@@ -17,6 +15,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 
+from container import git_diff
 from tools import ALL_TOOLS, EDIT_OK_PREFIX
 
 load_dotenv()
@@ -39,7 +38,6 @@ TOOL_MAP = {t.name: t for t in ALL_TOOLS}
 
 class SWEBenchState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    workspace_dir: str
     iteration: int
     max_iterations: int
     patch: str
@@ -286,19 +284,16 @@ def route_decision(state: SWEBenchState) -> str:
     if last_msg.tool_calls:
         return "tools"
 
-    workspace = Path(state["workspace_dir"])
-    diff = subprocess.run(["git", "diff"], cwd=workspace, capture_output=True, text=True)
-    if not diff.stdout.strip() and state["iteration"] < state["max_iterations"] - 2:
+    if not git_diff().strip() and state["iteration"] < state["max_iterations"] - 2:
         return "nudge"
 
     return "extract_patch"
 
 
 def extract_patch_node(state: SWEBenchState) -> dict:
-    workspace = Path(state["workspace_dir"])
-    subprocess.run(["git", "clean", "-f", "-q"], cwd=workspace)
-    res = subprocess.run(["git", "diff"], cwd=workspace, capture_output=True, text=True)
-    return {"patch": res.stdout.strip()}
+    # Diff against the baseline tag set by container.prepare(). No `git clean`:
+    # the image holds built files that must not be deleted.
+    return {"patch": git_diff()}
 
 
 # ---------------------------------------------------------------------------

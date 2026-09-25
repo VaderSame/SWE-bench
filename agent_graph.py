@@ -23,14 +23,30 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-NUDGE_AFTER = 8             # turn at which tool results carry an "edit now" reminder
-FORCE_EDIT_AFTER = 12       # turn at which the toolset shrinks to edit_file only (no successful edit yet)
-STUCK_DUPLICATES = 2        # consecutive rejected duplicates that trigger the same restriction
-MAX_STUCK = 4               # consecutive rejected duplicates that end the run early
-POST_EDIT_TURNS = 8         # agent turns allowed after the first successful edit, then the run ends
-KEEP_FULL_VIEWS = 6         # most recent real view_file outputs sent in full
-KEEP_FULL_OTHER = 2         # most recent real outputs of other tools sent in full
-STALE_OUTPUT_CHARS = 300    # everything older is cut to this many characters
+# Turn at which we force edit-only mode if no successful edit has happened.
+FORCE_EDIT_AFTER = 20
+# How many times the model may view the *exact same* read-only call before we
+# warn (+1) and then restrict to edit-only mode (+2 above warn).
+VIEW_REPEAT_WARN     = 2   # warn on the Nth repeat
+VIEW_REPEAT_RESTRICT = 5   # restrict on this many repeats
+
+# Failing edit calls: after this many failures with identical args, inject guidance.
+EDIT_FAIL_WARN = 2
+
+# Agent turns allowed after the first successful edit before the run ends.
+POST_EDIT_TURNS = 8
+
+# Context-window management.
+KEEP_FULL_VIEWS = 15
+KEEP_FULL_OTHER = 5
+STALE_OUTPUT_CHARS = 1500
+
+# Tools that are ALWAYS executed and never blocked/deduplicated.
+EDIT_TOOLS = {"replace_lines"}
+# Read-only tools subject to repeat-tracking.
+READ_TOOLS = {"view_file", "search_code", "repo_map", "explore_directory",
+              "run_python_repro", "run_bash"}
+
 DUP_PREFIX = "DUPLICATE CALL REJECTED"
 
 TOOL_MAP = {t.name: t for t in ALL_TOOLS}
@@ -43,25 +59,17 @@ class SWEBenchState(TypedDict):
     patch: str
 
 
-# Generic prompt: no hints about the specific bug, so results stay comparable.
 SYSTEM_PROMPT = """You are an autonomous software engineer fixing a bug in an open-source Python repository.
-Your task is to sequence and call the given tools appropriately in order to solve the bug.
-
-Available_tools:
-{tools_schema}
 
 Rules:
-1. Never repeat a tool call with the same arguments unless a file changed since. Duplicates are rejected.
-2. Do not inspect tiny windows of a file. View at least 60 lines at a time.
-3. Keep reasoning out of code you pass to run_python_repro and edit_file. Write minimal code only.
-4. edit_file replaces one exact occurrence of old_str with new_str. Copy old_str verbatim from a view_file
-   output (without the line-number prefix), include a few surrounding lines so it is unique, and make sure
-   new_str actually differs from old_str.
-5. Once you have identified the faulty line, call edit_file immediately.
-6. run_python_repro code must assert the expected behavior described in the issue and print PASS or FAIL.
-   A repro that only prints values cannot verify anything.
-7. After a successful edit, run your asserting repro to verify. If it prints PASS, conclude your response.
-   If it prints FAIL, correct the edit. Do not go back to exploring.
+1. Use view_file to read code. Always view at least 60 lines at a time.
+2. Use run_python_repro to reproduce the bug. The script MUST assert and print PASS or FAIL.
+3. Once you locate the faulty line, call replace_lines IMMEDIATELY.
+   replace_lines(file_path, start_line, end_line, new_str) replaces lines
+   start_line..end_line (1-indexed, inclusive). new_str must have correct indentation
+   and must NOT include the lines just outside that range.
+4. After a successful edit, run your repro to verify. PASS → done. FAIL → correct the edit.
+5. Do NOT keep re-reading lines you have already seen. Locate the bug, fix it, verify.
 """
 
 _base_llm = ChatOpenAI(
@@ -69,64 +77,31 @@ _base_llm = ChatOpenAI(
     openai_api_base=os.environ.get("OPENROUTER_SERVER"),
     model_name=os.environ.get("MODEL_ID"),
     temperature=0.2,
-    max_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "3000")),  # a runaway generation can look like a hang
-    timeout=float(os.getenv("LLM_TIMEOUT", "180")),          # raise instead of waiting forever
+    max_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "3000")),
+    timeout=float(os.getenv("LLM_TIMEOUT", "180")),
     max_retries=1,
-    # For a local vLLM server you can also try:
-    # extra_body={"repetition_penalty": 1.05},
 )
-llm = _base_llm.bind_tools(ALL_TOOLS)
-llm_edit_only = _base_llm.bind_tools([t for t in ALL_TOOLS if t.name == "edit_file"])
+llm           = _base_llm.bind_tools(ALL_TOOLS)
+llm_edit_only = _base_llm.bind_tools([t for t in ALL_TOOLS if t.name in EDIT_TOOLS])
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _call_signature(call: dict) -> str:
+def _call_sig(call: dict) -> str:
     return call["name"] + ":" + json.dumps(call["args"], sort_keys=True, default=str)
 
 
 def _is_successful_edit(m: BaseMessage) -> bool:
     return (
         isinstance(m, ToolMessage)
-        and m.name == "edit_file"
+        and m.name in EDIT_TOOLS
         and str(m.content).startswith(EDIT_OK_PREFIX)
     )
 
 
 def _successful_edits(messages: list[BaseMessage]) -> int:
     return sum(1 for m in messages if _is_successful_edit(m))
-
-
-def _view_range(call: dict):
-    a = call["args"]
-    try:
-        return a.get("file_path"), int(a.get("start_line") or 1), int(a.get("end_line") or 150)
-    except (TypeError, ValueError):
-        return None, 0, -1
-
-
-def _seen_signatures(messages: list[BaseMessage]):
-    """Earlier calls tagged with the 'edit epoch' they ran in.
-
-    The epoch increases after every successful edit, so re-viewing a file or
-    re-running a repro after the file changed is NOT a duplicate.
-    Also collects the line ranges already shown per (epoch, file), so overlapping
-    re-views can be rejected even when their arguments differ slightly.
-    Returns (seen_set, ranges, current_epoch).
-    """
-    seen, ranges, epoch = set(), {}, 0
-    for m in messages:
-        if isinstance(m, AIMessage):
-            for c in m.tool_calls:
-                seen.add((epoch, _call_signature(c)))
-                if c["name"] == "view_file":
-                    path, s, e = _view_range(c)
-                    if path and s <= e:
-                        ranges.setdefault((epoch, path), []).append((s, e))
-        elif _is_successful_edit(m):
-            epoch += 1
-    return seen, ranges, epoch
 
 
 def _turns_since_first_edit(messages: list[BaseMessage]) -> int:
@@ -139,25 +114,61 @@ def _turns_since_first_edit(messages: list[BaseMessage]) -> int:
     return n
 
 
-def _consecutive_duplicates(messages: list[BaseMessage]) -> int:
-    n = 0
+def _read_call_counts(messages: list[BaseMessage]) -> dict[str, int]:
+    """Count read-only tool calls since the last successful edit (or from start)."""
+    counts: dict[str, int] = {}
+    for m in messages:
+        if _is_successful_edit(m):
+            counts = {}
+        elif isinstance(m, AIMessage):
+            for c in m.tool_calls:
+                if c["name"] in READ_TOOLS:
+                    sig = _call_sig(c)
+                    counts[sig] = counts.get(sig, 0) + 1
+    return counts
+
+
+def _failed_edit_counts(messages: list[BaseMessage]) -> dict[str, int]:
+    """
+    Count how many times each replace_lines signature has FAILED (not succeeded).
+    Resets after a successful edit. Uses tool_call_id to correlate calls → results.
+    """
+    counts: dict[str, int] = {}
+    pending: dict[str, str] = {}   # tool_call_id -> call signature
+
+    for m in messages:
+        if isinstance(m, AIMessage):
+            for c in m.tool_calls:
+                if c["name"] in EDIT_TOOLS:
+                    pending[c["id"]] = _call_sig(c)
+        elif isinstance(m, ToolMessage) and m.name in EDIT_TOOLS:
+            sig = pending.pop(m.tool_call_id, None)
+            if sig is not None:
+                if str(m.content).startswith(EDIT_OK_PREFIX):
+                    counts = {}          # any success resets all failure counts
+                else:
+                    counts[sig] = counts.get(sig, 0) + 1
+    return counts
+
+
+def _last_view_content(messages: list[BaseMessage]) -> str:
+    """Content of the most recent successful view_file ToolMessage."""
     for m in reversed(messages):
-        if isinstance(m, ToolMessage):
-            if str(m.content).startswith(DUP_PREFIX):
-                n += 1
-            else:
-                break
-    return n
+        if isinstance(m, ToolMessage) and m.name == "view_file":
+            c = str(m.content)
+            if not c.startswith(DUP_PREFIX):
+                return c
+    return ""
 
 
 def _compact_history(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Copy of the history with old tool outputs shortened. Stored state is untouched."""
+    """Shallow-copy of history with stale tool outputs truncated."""
 
     def is_real(m):
         return isinstance(m, ToolMessage) and not str(m.content).startswith(DUP_PREFIX)
 
-    views = [i for i, m in enumerate(messages) if is_real(m) and m.name == "view_file"]
-    others = [i for i, m in enumerate(messages) if is_real(m) and m.name != "view_file"]
+    views  = [i for i, m in enumerate(messages) if is_real(m) and m.name == "view_file"]
+    others = [i for i, m in enumerate(messages) if is_real(m) and m.name not in ("view_file",)]
     keep_full = set(views[-KEEP_FULL_VIEWS:]) | set(others[-KEEP_FULL_OTHER:])
 
     out = []
@@ -180,83 +191,81 @@ def _compact_history(messages: list[BaseMessage]) -> list[BaseMessage]:
 # ---------------------------------------------------------------------------
 def agent_node(state: SWEBenchState) -> dict:
     messages = _compact_history(state["messages"])
-    no_edit = _successful_edits(state["messages"]) == 0
-    stuck = _consecutive_duplicates(state["messages"]) >= STUCK_DUPLICATES
-    restrict = no_edit and (stuck or state["iteration"] >= FORCE_EDIT_AFTER)
+    no_edit  = _successful_edits(state["messages"]) == 0
+    counts   = _read_call_counts(state["messages"])
+    max_reps = max(counts.values(), default=0)
 
-    if restrict:
-        # Server-independent: only edit_file exists, so further exploring is impossible.
-        messages = messages + [
-            HumanMessage(
-                content="Exploration is over and only `edit_file` is available. Using the code you "
-                "have already viewed, apply your best fix now. Copy old_str exactly from the viewed code."
-            )
-        ]
+    force_edit = no_edit and (
+        state["iteration"] >= FORCE_EDIT_AFTER
+        or max_reps >= VIEW_REPEAT_RESTRICT
+    )
+
+    if force_edit:
+        last_view = _last_view_content(state["messages"])
+        ctx = f"\nFor reference, the last code you viewed:\n{last_view}\n" if last_view else ""
+        msg = (
+            "You have spent enough turns reading code."
+            f"{ctx}"
+            "ONLY `replace_lines` is available now. Apply your fix immediately using "
+            "the line numbers shown above."
+        )
+        messages = messages + [HumanMessage(content=msg)]
         model = llm_edit_only
     else:
         model = llm
         if not no_edit:
             messages = messages + [
                 HumanMessage(
-                    content="An edit has been applied. Do not explore further. Verify with a repro that "
-                    "asserts the expected output from the issue and prints PASS or FAIL. If PASS, finish. "
-                    "If FAIL, correct your edit."
+                    content="An edit has been applied. Verify with run_python_repro (assert + "
+                    "print PASS or FAIL). PASS → done. FAIL → fix the edit."
                 )
             ]
+
     response = model.invoke(messages)
     return {"messages": [response], "iteration": state["iteration"] + 1}
 
 
 def tools_node(state: SWEBenchState) -> dict:
-    """Runs tool calls, rejecting exact duplicates issued since the last successful edit."""
     messages = state["messages"]
-    last = messages[-1]
+    last     = messages[-1]
 
-    seen, ranges, epoch = _seen_signatures(messages[:-1])
+    read_counts = _read_call_counts(messages[:-1])
+    fail_counts = _failed_edit_counts(messages[:-1])
 
     results = []
     for call in last.tool_calls:
-        key = (epoch, _call_signature(call))
-        covered = None
-        if call["name"] == "view_file":
-            path, s, e = _view_range(call)
-            if path and s <= e:
-                covered = next(
-                    ((a, b) for a, b in ranges.get((epoch, path), []) if a <= s and e <= b), None
+        tool = TOOL_MAP.get(call["name"])
+        try:
+            content = str(tool.invoke(call["args"])) if tool else f"Unknown tool {call['name']}"
+        except Exception as e_:
+            content = f"Tool error: {e_}"
+
+        if call["name"] in READ_TOOLS:
+            sig = _call_sig(call)
+            n   = read_counts.get(sig, 0)
+            if n >= VIEW_REPEAT_WARN:
+                nth = {2: "3rd", 3: "4th", 4: "5th"}.get(n, f"{n+1}th")
+                content += (
+                    f"\n\n[WARNING: This is the {nth} time you called `{call['name']}` "
+                    "with these exact arguments and no edit has been applied yet. "
+                    "Stop re-reading and call `replace_lines` NOW.]"
                 )
-        if key in seen:
-            content = (
-                f"{DUP_PREFIX}: `{call['name']}` was already run with these exact arguments and no edit "
-                "has succeeded since, so the result is unchanged and is earlier in the conversation. "
-                "Do something different. If you already know the faulty code, call edit_file now."
-            )
-        elif covered:
-            content = (
-                f"{DUP_PREFIX}: lines {s}-{e} of {path} were already shown in an earlier view_file output "
-                f"(lines {covered[0]}-{covered[1]}) and the file has not changed since. Read that output "
-                "instead, then act on it. If you know the faulty code, call edit_file now."
-            )
-        else:
-            tool = TOOL_MAP.get(call["name"])
-            try:
-                content = str(tool.invoke(call["args"])) if tool else f"Unknown tool {call['name']}"
-            except Exception as e_:
-                content = f"Tool error: {e_}"
-            if call["name"] == "view_file":
-                path, s, e = _view_range(call)
-                if path and s <= e:
-                    ranges.setdefault((epoch, path), []).append((s, e))
-        seen.add(key)
+            read_counts[sig] = n + 1   # update so multiple calls in one turn are tracked
+
+        elif call["name"] in EDIT_TOOLS:
+            sig    = _call_sig(call)
+            n_fail = fail_counts.get(sig, 0)
+            if n_fail >= EDIT_FAIL_WARN and not content.startswith(EDIT_OK_PREFIX):
+                content += (
+                    f"\n\n[CRITICAL: This exact replace_lines call has failed {n_fail + 1} times. "
+                    "• 'identical content' → those lines are already correct; the bug is ELSEWHERE. "
+                    "Use view_file or search_code to look at a different function. "
+                    "• SyntaxError → your new_str includes context lines that surround start_line..end_line. "
+                    "Only include the lines that replace the range, nothing outside it.]"
+                )
+
         results.append(ToolMessage(content=content, tool_call_id=call["id"], name=call["name"]))
 
-    if results and state["iteration"] >= NUDGE_AFTER and _successful_edits(messages) == 0:
-        results[-1] = results[-1].model_copy(
-            update={
-                "content": results[-1].content
-                + f"\n\n[Reminder: {state['iteration']} of {state['max_iterations']} turns used "
-                "and no edit has been applied. Stop exploring and call edit_file.]"
-            }
-        )
     return {"messages": results}
 
 
@@ -264,7 +273,8 @@ def nudge_node(state: SWEBenchState) -> dict:
     return {
         "messages": [
             HumanMessage(
-                content="You have not modified any files yet. Call `edit_file` now to apply your fix."
+                content="You have not modified any files yet. "
+                "Call `replace_lines` now to apply your fix."
             )
         ]
     }
@@ -272,9 +282,6 @@ def nudge_node(state: SWEBenchState) -> dict:
 
 def route_decision(state: SWEBenchState) -> str:
     if state["iteration"] >= state["max_iterations"]:
-        return "extract_patch"
-
-    if _consecutive_duplicates(state["messages"]) >= MAX_STUCK:
         return "extract_patch"
 
     if _turns_since_first_edit(state["messages"]) >= POST_EDIT_TURNS:
@@ -291,8 +298,6 @@ def route_decision(state: SWEBenchState) -> str:
 
 
 def extract_patch_node(state: SWEBenchState) -> dict:
-    # Diff against the baseline tag set by container.prepare(). No `git clean`:
-    # the image holds built files that must not be deleted.
     return {"patch": git_diff()}
 
 
@@ -300,9 +305,9 @@ def extract_patch_node(state: SWEBenchState) -> dict:
 # Graph
 # ---------------------------------------------------------------------------
 builder = StateGraph(SWEBenchState)
-builder.add_node("agent", agent_node)
-builder.add_node("tools", tools_node)
-builder.add_node("nudge", nudge_node)
+builder.add_node("agent",         agent_node)
+builder.add_node("tools",         tools_node)
+builder.add_node("nudge",         nudge_node)
 builder.add_node("extract_patch", extract_patch_node)
 
 builder.add_edge(START, "agent")
@@ -311,8 +316,8 @@ builder.add_conditional_edges(
     route_decision,
     {"tools": "tools", "nudge": "nudge", "extract_patch": "extract_patch"},
 )
-builder.add_edge("tools", "agent")
-builder.add_edge("nudge", "agent")
+builder.add_edge("tools",         "agent")
+builder.add_edge("nudge",         "agent")
 builder.add_edge("extract_patch", END)
 
 swe_agent = builder.compile()

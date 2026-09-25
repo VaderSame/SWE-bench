@@ -210,8 +210,11 @@ def explore_directory(path: str = ".") -> str:
 
 
 @tool
-def view_file(file_path: str, start_line: int = 1, end_line: int = 150) -> str:
-    """View lines from a file with line numbers. View at least 60 lines at a time."""
+def view_file(file_path: str, start_line: int = 1, end_line: int = 0) -> str:
+    """View lines from a file with line numbers. View at least 60 lines at a time.
+    
+    If end_line is omitted or 0, defaults to start_line + 149 (150 lines window).
+    """
     target = ct.resolve(file_path)
     raw = ct.read_bytes(target) if target else None
     if raw is None:
@@ -219,11 +222,12 @@ def view_file(file_path: str, start_line: int = 1, end_line: int = 150) -> str:
 
     lines = _split_lines(ct.text(raw))
     start = max(1, start_line)
+    # If end_line not given (0) or less than start, compute a 150-line window.
+    if end_line < start:
+        end_line = start + 149
     end = min(len(lines), end_line)
     if start > len(lines):
         return f"File has only {len(lines)} lines."
-    if end < start:
-        return f"Error: end_line ({end_line}) must be >= start_line ({start_line}). File has {len(lines)} lines."
     return "".join(f"{i + start:4d} | {line}\n" for i, line in enumerate(lines[start - 1:end]))
 
 
@@ -259,67 +263,68 @@ def _syntax_error(source: str):
 
 
 @tool
-def edit_file(file_path: str, old_str: str, new_str: str) -> str:
-    """Replace exactly one occurrence of old_str with new_str in a file.
+def replace_lines(file_path: str, start_line: int, end_line: int, new_str: str) -> str:
+    """Replace lines start_line through end_line (inclusive) with new_str.
 
-    old_str must match the file text exactly (indentation included) and appear exactly once,
-    so include a few surrounding lines if needed. There are no line numbers to go stale.
-    Python syntax is validated and invalid edits are not applied. Returns the updated region.
+    start_line and end_line are 1-indexed. To insert lines without replacing any,
+    set end_line = start_line - 1. Returns the updated region with surrounding context.
+    IMPORTANT: new_str replaces ONLY the specified lines. Do not include lines outside
+    that range (e.g. the surrounding if/else/def lines) in new_str.
     """
-    if not old_str:
-        return "Error: old_str is empty."
-    if old_str == new_str:
-        return "Error: old_str and new_str are identical, so nothing would change. Make a real change."
+    if start_line < 1:
+        return "Error: start_line must be >= 1."
+    if end_line < start_line - 1:
+        return f"Error: end_line ({end_line}) cannot be less than start_line - 1 ({start_line - 1})."
 
     target = ct.resolve(file_path)
     raw = ct.read_bytes(target) if target else None
     if raw is None:
         return f"Error: File '{file_path}' does not exist."
     try:
-        content = raw.decode("utf-8")  # bytes -> str keeps line endings untouched
+        content = raw.decode("utf-8")
     except UnicodeDecodeError:
         return f"Error: '{file_path}' is not valid UTF-8, refusing to edit it."
 
-    # Keep the file's own line endings.
-    if "\r\n" in content:
-        old_str = old_str.replace("\r\n", "\n").replace("\n", "\r\n")
-        new_str = new_str.replace("\r\n", "\n").replace("\n", "\r\n")
+    lines = _split_lines(content)
+    if start_line > len(lines) + 1:
+        return f"Error: start_line ({start_line}) is beyond the end of the file (which has {len(lines)} lines)."
 
-    count = content.count(old_str)
-    if count == 0:
-        return _not_found_message(content, old_str)
-    if count > 1:
-        starts, pos = [], 0
-        while len(starts) < 5:
-            pos = content.find(old_str, pos)
-            if pos == -1:
-                break
-            starts.append(content[:pos].count("\n") + 1)
-            pos += 1
+    start_idx = start_line - 1
+    end_idx = min(end_line, len(lines))
+
+    def _context_block(label: str) -> str:
+        lo = max(0, start_idx - 3)
+        hi = min(len(lines), end_idx + 3)
+        return f"{label}\n{_numbered(lines, lo, hi)}"
+
+    new_lines = _split_lines(new_str) if new_str else []
+
+    if lines[start_idx:end_idx] == new_lines:
         return (
-            f"Error: old_str matches {count} places (starting at lines {starts}). "
-            "Add more surrounding lines so it is unique."
+            "Error: The new code is exactly identical to the lines being replaced. Nothing would change.\n"
+            + _context_block("Current file content around target lines:")
         )
 
-    new_content = content.replace(old_str, new_str, 1)
+    resulting_lines = lines[:start_idx] + new_lines + lines[end_idx:]
+    new_content = "\n".join(resulting_lines)
+    if content.endswith("\n") and not new_content.endswith("\n"):
+        new_content += "\n"
 
-    # Only enforce syntax if the file parsed before the edit (the host's Python
-    # may not accept every construct in an old repository).
     if target.endswith(".py") and _syntax_error(content) is None:
         err = _syntax_error(new_content)
         if err is not None:
             return (
-                f"Edit NOT applied, SyntaxError: {err.msg} at line {err.lineno} of the resulting file. "
-                "Check indentation of new_str and retry."
+                f"Edit NOT applied, SyntaxError: {err.msg} at line {err.lineno} of the resulting file.\n"
+                "Remember: new_str replaces ONLY lines start_line..end_line. Do NOT include surrounding "
+                "lines (e.g. the 'else:' or 'def' that comes before start_line) in new_str.\n"
+                + _context_block("Current file content around target lines (for reference):")
             )
 
     ct.write_bytes(target, new_content.encode("utf-8"))
 
-    start_line = content[: content.find(old_str)].count("\n") + 1
-    new_lines = _split_lines(new_content)
-    span = new_str.count("\n") + 1
-    lo, hi = max(0, start_line - 4), min(len(new_lines), start_line - 1 + span + 3)
-    return f"{EDIT_OK_PREFIX} {file_path}. Updated region:\n{_numbered(new_lines, lo, hi)}"
+    span = len(new_lines)
+    lo, hi = max(0, start_idx - 4), min(len(resulting_lines), start_idx + span + 3)
+    return f"{EDIT_OK_PREFIX} {file_path}. Updated region:\n{_numbered(resulting_lines, lo, hi)}"
 
 
 def _format_output(rc: int, out: str, err: str, timeout: int) -> str:
@@ -360,4 +365,4 @@ def run_python_repro(code: str) -> str:
     return output if output else f"[Process exited with code {rc} and no output]"
 
 
-ALL_TOOLS = [search_code, explore_directory, repo_map, view_file, edit_file, run_bash, run_python_repro]
+ALL_TOOLS = [search_code, explore_directory, repo_map, view_file, replace_lines, run_bash, run_python_repro]

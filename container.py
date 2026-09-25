@@ -10,6 +10,10 @@ import os
 import posixpath
 import subprocess
 
+import structlog
+
+log = structlog.get_logger("container")
+
 ROOT = "/testbed"
 BASELINE_TAG = "swe-baseline"
 
@@ -129,27 +133,26 @@ def prepare(base_commit: str) -> None:
     has_baseline = exec_raw(["git", "rev-parse", "-q", "--verify", f"refs/tags/{BASELINE_TAG}"]).returncode == 0
     if has_baseline:
         git("reset", "--hard", BASELINE_TAG)
-        print("[*] Container already had a baseline; reset tracked files to it.")
+        log.info("baseline_reset", tag=BASELINE_TAG)
     else:
         if git("status", "--porcelain", "--untracked-files=no"):
-            print("[!] Image has uncommitted tracked changes; committing them as the baseline "
-                  "so they never show up in the agent's patch.")
+            log.warning("uncommitted_changes", action="committing_as_baseline")
             git("-c", "user.name=swe-agent", "-c", "user.email=swe-agent@localhost",
                 "commit", "-q", "-a", "-m", "baseline")
         git("tag", BASELINE_TAG)
 
     head = git("rev-parse", "HEAD")
     if head == base_commit:
-        print(f"[+] {ROOT} is at the dataset base_commit ({base_commit[:10]}).")
+        log.info("baseline_ok", root=ROOT, commit=base_commit[:10])
     else:
         res = exec_raw(["git", "diff", "--shortstat", base_commit, "HEAD"], timeout=60)
         if res.returncode != 0:
             detail = "base_commit not found in the image's repository"
         else:
             detail = text(res.stdout).strip() or "no file differences"
-        print(f"[!] Baseline {head[:10]} differs from base_commit {base_commit[:10]}: {detail}")
+        log.warning("baseline_mismatch", head=head[:10], base_commit=base_commit[:10], diff=detail)
 
     rc, out, err = run_script('python -c "import sys; print(sys.version.split()[0], sys.executable)"')
     if rc != 0:
         raise RuntimeError(f"conda env 'testbed' is not usable: {(err or out).strip()}")
-    print(f"[+] Python in the testbed env: {out.strip()}")
+    log.info("python_env_ok", python=out.strip())

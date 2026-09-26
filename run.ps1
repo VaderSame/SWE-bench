@@ -1,6 +1,7 @@
 # run.ps1
 param (
-    [string]$InstanceId = "astropy__astropy-12907",
+    # [string]$InstanceId = "astropy__astropy-12907",
+    [string]$InstanceId = "astropy__astropy-14182",
     [string]$ContainerName = "swe_agnostic_env",
     [switch]$KeepContainer   # leave the container running afterwards, e.g. to `docker exec -it $ContainerName bash`
 )

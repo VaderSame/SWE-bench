@@ -105,6 +105,8 @@ def _action_fields(tool_name: str, args: dict) -> dict:
         return out
     if tool_name == "run_python_repro":
         return {"lines_of_code": args.get("code", "").count("\n") + 1}
+    if tool_name == "run_pytest":
+        return {"target": args.get("test_target", "")}
     if tool_name == "run_bash":
         cmd = args.get("command", "")
         return {"cmd": (cmd[:50] + "…") if len(cmd) > 50 else cmd}
@@ -121,6 +123,10 @@ def _parsed_metadata(tool_name: str, content: str) -> tuple[str, dict]:
         if "PASS" in content: return "info", {"verdict": "PASS"}
         if "FAIL" in content: return "warning", {"verdict": "FAIL"}
         return "error", {"verdict": "ERROR"}
+    if tool_name == "run_pytest":
+        if "fail" in content.lower() or "error" in content.lower(): return "warning", {"verdict": "FAIL"}
+        if "pass" in content.lower(): return "info", {"verdict": "PASS"}
+        return "info", {"length": len(content)}
     if tool_name == "replace_lines":
         if content.startswith(EDIT_OK_PREFIX): return "info", {"status": "applied"}
         return "warning", {"status": "failed"}
@@ -179,9 +185,11 @@ def main() -> None:
         "iteration":      0,
         "max_iterations": MAX_ITER,
         "patch":          "",
+        "audit_passed":   False,
+        "audit_count":    0,
     }
 
-    log.info("agent_start", model=model_id, max_iter=MAX_ITER)
+    log.info("agent_start", model=model_id, initial_state=initial_state, max_iter=MAX_ITER)
 
     final_patch: str = ""
     pending_edit_ids: set[str] = set()
@@ -190,7 +198,7 @@ def main() -> None:
     try:
         for event in swe_agent.stream(
             initial_state,
-            config={"recursion_limit": MAX_ITER * 3 + 10},
+            config={"recursion_limit": MAX_ITER},
             stream_mode="updates",
         ):
             for node_name, node_output in event.items():
@@ -243,13 +251,24 @@ def main() -> None:
                             else:
                                 metrics["edits_failed"] += 1
 
-                        # Exact original code output limit (truncates exactly like it did earlier)
-                        preview = text[:300] + "..." if len(text) > 300 else text
+                        # Print informative preview (up to 1200 chars for repro/pytest/errors, 500 for code views)
+                        max_preview = 1200 if msg.name in ("run_python_repro", "run_pytest") or is_dup else 500
+                        preview = text[:max_preview] + "\n... [output truncated for display]" if len(text) > max_preview else text
                         print(f"-> Tool Output:\n{preview}")
 
                         # Parsed metadata for the result
                         level, fields = _parsed_metadata(msg.name, text)
                         getattr(log, level)("tool_result", tool=msg.name, **fields)
+
+                elif node_name == "audit":
+                    print("\n--- [Node: audit] ---")
+                    msg = node_output["messages"][-1]
+                    passed = node_output.get("audit_passed", False)
+                    print(f"-> Audit Status: {'PASSED' if passed else 'FAILED'}")
+                    text = str(msg.content)
+                    preview = text[:800] + "\n..." if len(text) > 800 else text
+                    print(f"-> Audit Feedback:\n{preview}")
+                    log.info("audit_result", passed=passed)
 
                 elif node_name == "extract_patch":
                     final_patch = node_output.get("patch", "")

@@ -227,8 +227,11 @@ def view_file(file_path: str, start_line: int = 1, end_line: int = 0) -> str:
         end_line = start + 149
     end = min(len(lines), end_line)
     if start > len(lines):
-        return f"File has only {len(lines)} lines."
-    return "".join(f"{i + start:4d} | {line}\n" for i, line in enumerate(lines[start - 1:end]))
+        return f"File has only {len(lines)} lines. Requested start_line ({start}) is beyond the end of the file."
+    output = "".join(f"{i + start:4d} | {line}\n" for i, line in enumerate(lines[start - 1:end]))
+    if end >= len(lines):
+        output += f"[END OF FILE: {len(lines)} lines total]\n"
+    return output
 
 
 def _numbered(lines: list[str], lo: int, hi: int) -> str:
@@ -365,4 +368,20 @@ def run_python_repro(code: str) -> str:
     return output if output else f"[Process exited with code {rc} and no output]"
 
 
-ALL_TOOLS = [search_code, explore_directory, repo_map, view_file, replace_lines, run_bash, run_python_repro]
+@tool
+def run_pytest(test_target: str = "") -> str:
+    """Run pytest inside the container using the project's active conda environment.
+    
+    Args:
+        test_target: Path to a test file or specific test function, e.g.:
+                     'astropy/io/ascii/tests/test_rst.py'
+                     or 'astropy/io/ascii/tests/test_rst.py::test_write_normal'.
+                     If omitted or empty, runs pytest on default discovery.
+    """
+    target = test_target.strip()
+    cmd = f"pytest -v {target}" if target else "pytest"
+    rc, out, err = ct.run_script(cmd, timeout=90)
+    return _format_output(rc, out, err, 90)
+
+
+ALL_TOOLS = [search_code, explore_directory, repo_map, view_file, replace_lines, run_bash, run_python_repro, run_pytest]
